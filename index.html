@@ -594,12 +594,21 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
     const id = crypto.randomUUID();
     progress('Sending the request…');
     const env = await encrypt({ ...payload, id, at: Date.now() }, password);
-    await gh(`contents/actions/${id}.json`, { method: 'PUT', body: JSON.stringify({ message: `action ${id}`, branch: r.queueBranch, content: btoa(JSON.stringify(env)) }) });
+    const body = JSON.stringify({ message: `action ${id}`, branch: r.queueBranch, content: btoa(JSON.stringify(env)) });
+    for (let i = 0; ; i++) { // writes on the same branch can race with the bot: retry on conflict
+      try { await gh(`contents/actions/${id}.json`, { method: 'PUT', body }); break; }
+      catch (e) { if (i >= 3 || !/409|422/.test(e.message)) throw e; await sleep(500 * (i + 1)); }
+    }
     const start = Date.now();
+    let head = null;
     while (Date.now() - start < 90_000) {
       progress(`Waiting for the bot… ${Math.round((Date.now() - start) / 1000)}s`);
-      await sleep(2500);
-      const f = await gh(`contents/results/${id}.json?ref=${r.queueBranch}`, { allow404: true }).catch(() => null);
+      await sleep(1200);
+      // Watch the branch head; read the result at that exact commit (never a stale copy).
+      const ref = await gh(`git/ref/heads/${r.queueBranch}`).catch(() => null);
+      if (!ref || ref.object.sha === head) continue;
+      head = ref.object.sha;
+      const f = await gh(`contents/results/${id}.json?ref=${head}`, { allow404: true }).catch(() => null);
       if (!f) continue;
       const res = await decrypt(JSON.parse(atob(f.content.replace(/\n/g, ''))), password);
       gh(`contents/results/${id}.json`, { method: 'DELETE', body: JSON.stringify({ message: `ack ${id}`, sha: f.sha, branch: r.queueBranch }) }).catch(() => {});
