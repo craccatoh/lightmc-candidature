@@ -193,6 +193,18 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
   </main>
 </section>
 
+<dialog id="login"><form class="dlg" method="dialog">
+  <h4>🔐 Staff sign-in</h4>
+  <p>The bot will send a 6-digit code to your Discord DMs. Only staff members can sign in.</p>
+  <div id="lstep1"><input class="field" id="luser" placeholder="Your Discord username or user ID" autocomplete="username"></div>
+  <div id="lstep2" class="hidden"><input class="field" id="lcode" placeholder="6-digit code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" style="letter-spacing:.4em;font-size:20px;text-align:center"></div>
+  <div class="status" id="lstatus"></div>
+  <div class="row">
+    <button class="btn" value="cancel" formnovalidate>Cancel</button>
+    <button class="btn primary" id="lgo">Send me a code</button>
+  </div>
+</form></dialog>
+
 <dialog id="dlg"><form class="dlg" method="dialog" id="dlgform">
   <h4 id="dlgtitle">Confirm</h4>
   <p id="dlgtext"></p>
@@ -210,7 +222,7 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
 (() => {
   'use strict';
   const DATA_URL = 'data.enc.json';
-  const PW_KEY = 'lmc_dash_pw', DC_KEY = 'lmc_dash_discord', STATE_KEY = 'lmc_oauth_state', RET_KEY = 'lmc_oauth_return';
+  const PW_KEY = 'lmc_dash_pw', DC_KEY = 'lmc_dash_staff';
   const ITER = 250000;
   const $ = (s) => document.querySelector(s);
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -276,57 +288,58 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
     try { return await decrypt(env, pw); } catch { const e = new Error('Wrong password.'); e.badpw = true; throw e; }
   }
 
-  // ---------- Discord sign-in (OAuth implicit grant, scope "identify") ----------
+  // ---------- staff sign-in: the bot DMs a 6-digit code ----------
   function readDiscord() {
-    try { const d = JSON.parse(kv.get(DC_KEY) || 'null'); return d && d.exp > Date.now() + 60_000 ? d : null; } catch { return null; }
+    try { const d = JSON.parse(kv.get(DC_KEY) || 'null'); return d && d.session && d.exp > Date.now() + 60_000 ? d : null; } catch { return null; }
   }
-  function handleOAuthReturn() {
-    if (/[#&]error=/.test(location.hash) && /state=/.test(location.hash)) {
-      const err = new URLSearchParams(location.hash.slice(1)).get('error_description') || 'cancelled';
-      history.replaceState(null, '', location.pathname + (kv.ss(RET_KEY) || ''));
-      kv.ss(RET_KEY, null); kv.ss(STATE_KEY, null);
-      return toastLater(`Discord sign-in failed: ${err}`);
-    }
-    if (!location.hash.includes('access_token=')) return;
-    const p = new URLSearchParams(location.hash.slice(1));
-    const ok = p.get('state') && p.get('state') === kv.ss(STATE_KEY);
-    kv.ss(STATE_KEY, null);
-    const back = kv.ss(RET_KEY) || '';
-    kv.ss(RET_KEY, null);
-    history.replaceState(null, '', location.pathname + back);
-    if (!ok) return toastLater('Discord sign-in failed (state mismatch). Please try again.');
-    const d = { token: p.get('access_token'), exp: Date.now() + Number(p.get('expires_in') || 3600) * 1000, user: null };
-    kv.set(DC_KEY, JSON.stringify(d), !!localStorage.getItem(PW_KEY));
-  }
-  async function fetchDiscordUser() {
-    if (!discord || discord.user) return;
-    try {
-      const r = await fetch('https://discord.com/api/v10/users/@me', { headers: { Authorization: `Bearer ${discord.token}` } });
-      if (r.status === 401) { kv.del(DC_KEY); discord = null; return; }
-      if (r.ok) { discord.user = await r.json(); kv.set(DC_KEY, JSON.stringify(discord), !!localStorage.getItem(PW_KEY)); }
-    } catch {}
-  }
-  function signIn() {
-    const id = DB?.remote?.discordClientId;
-    if (!id) return toast("The bot hasn't shared its Discord app ID yet — refresh in a minute.");
-    const state = b64e(crypto.getRandomValues(new Uint8Array(16))).replace(/[^a-z0-9]/gi, '');
-    kv.ss(STATE_KEY, state);
-    kv.ss(RET_KEY, location.hash || '');
-    const q = new URLSearchParams({ client_id: id, response_type: 'token', scope: 'identify', redirect_uri: location.origin + location.pathname, state });
-    location.href = `https://discord.com/oauth2/authorize?${q}`;
+  function signIn() { openLogin(); }
+  function signOut() {
+    const s = discord?.session;
+    kv.del(DC_KEY); discord = null; render();
+    if (s) queue({ action: 'logout', session: s }, () => {}).catch(() => {});
   }
   function renderAuth() {
     const el = $('#auth');
     if (!DB?.remote?.token) { el.innerHTML = ''; return; }
     if (!discord) {
-      el.innerHTML = `<button class="btn discord" id="signin">Sign in with Discord</button>`;
+      el.innerHTML = `<button class="btn discord" id="signin">🔐 Staff sign-in</button>`;
       $('#signin').onclick = signIn;
       return;
     }
-    const u = discord.user;
-    const av = u?.avatar ? `https://cdn.discordapp.com/avatars/${u.id}/${u.avatar}.png?size=64` : 'logo.png';
-    el.innerHTML = `<div class="me" title="Signed in with Discord"><img src="${esc(av)}" alt=""><span>${esc(u?.global_name || u?.username || 'Discord')}</span><button id="signout" title="Sign out">✕</button></div>`;
-    $('#signout').onclick = () => { kv.del(DC_KEY); discord = null; render(); };
+    const u = discord.user || {};
+    el.innerHTML = `<div class="me" title="Signed in as @${esc(u.username)}"><img src="${esc(u.avatar || 'logo.png')}" alt=""><span>${esc(u.displayName || u.username || 'Staff')}</span><button id="signout" title="Sign out">✕</button></div>`;
+    $('#signout').onclick = signOut;
+  }
+  function openLogin() {
+    const dlg = $('#login'), go = $('#lgo'), st = $('#lstatus');
+    let challenge = null;
+    const step = (n) => { $('#lstep1').classList.toggle('hidden', n !== 1); $('#lstep2').classList.toggle('hidden', n !== 2); go.textContent = n === 1 ? 'Send me a code' : 'Sign in'; };
+    step(1); st.innerHTML = ''; $('#luser').value = ''; $('#lcode').value = ''; go.disabled = false;
+    const busy = (t) => st.innerHTML = `<span class="spin"></span>${esc(t)}`;
+    const err = (t) => st.innerHTML = `<span style="color:var(--denied)">⚠️ ${esc(t)}</span>`;
+    go.onclick = async (ev) => {
+      ev.preventDefault(); go.disabled = true;
+      try {
+        if (!challenge) {
+          const user = $('#luser').value.trim();
+          if (!user) { err('Type your Discord username or ID.'); return; }
+          const r = await queue({ action: 'login', user }, busy);
+          if (!r.ok) { err(`${r.title}: ${r.text}`); return; }
+          challenge = r.challenge; step(2);
+          st.innerHTML = `✅ Code sent by DM to <b>${esc(r.user.displayName || r.user.username)}</b>. Check Discord.`;
+          setTimeout(() => $('#lcode').focus(), 50);
+        } else {
+          const r = await queue({ action: 'verify', challenge, code: $('#lcode').value }, busy);
+          if (!r.ok) { err(`${r.title}: ${r.text}`); if (r.restart) { challenge = null; step(1); } return; }
+          discord = { session: r.session, exp: r.exp, user: r.user };
+          kv.set(DC_KEY, JSON.stringify(discord), !!localStorage.getItem(PW_KEY));
+          dlg.close(); render(); toast(`Signed in as ${r.user.displayName || r.user.username}`);
+        }
+      } catch (e) { err(e.message); }
+      finally { go.disabled = false; }
+    };
+    dlg.showModal();
+    setTimeout(() => $('#luser').focus(), 50);
   }
 
   // ---------- lock ----------
@@ -366,7 +379,6 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
     discord = readDiscord();
     render();
     if (DB.remote?.token) refresh(true); // swap the (possibly cached) Pages copy for the live one
-    if (discord && !discord.user) { await fetchDiscordUser(); renderAuth(); }
     setInterval(() => document.visibilityState === 'visible' && !$('#dlg').open && refresh(true), 30_000);
   }
 
@@ -457,8 +469,8 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
       <button class="btn ok" data-act="accept">✅ Accept</button>
       <button class="btn no" data-act="deny">❌ Deny</button>
       ${a.status === 'pending' ? '<button class="btn rev" data-act="review">👀 Under review</button>' : ''}`;
-    return `<div class="decide"><span class="lbl">Decision</span>${discord ? btns : '<button class="btn discord" data-act="signin">Sign in with Discord to decide</button>'}
-      <span class="hint">${discord ? 'Same as the buttons in the Discord log: the applicant gets a DM and the log message is updated.' : 'Your Discord account is used to check that you are allowed to review this role.'}</span></div>`;
+    return `<div class="decide"><span class="lbl">Decision</span>${discord ? btns : '<button class="btn discord" data-act="signin">🔐 Sign in to decide</button>'}
+      <span class="hint">${discord ? 'Same as the buttons in the Discord log: the applicant gets a DM and the log message is updated.' : 'Sign in once with a code the bot sends you on Discord: it checks you are allowed to review this role.'}</span></div>`;
   }
 
   function renderDetail() {
@@ -559,7 +571,7 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
           setTimeout(() => refresh(true), 6000);
         } else {
           $('#dlgstatus').innerHTML = `<span style="color:var(--denied)">⚠️ ${esc(res.title)}: ${esc(res.text)}</span>`;
-          if (/Discord login expired/i.test(res.text)) { kv.del(DC_KEY); discord = null; renderAuth(); }
+          if (res.signedOut) { kv.del(DC_KEY); discord = null; renderAuth(); }
           if (res.app) { const i = DB.applications.findIndex((x) => x.id === res.app.id); if (i >= 0) DB.applications[i] = res.app; render(); }
           $('#dlgcancel').disabled = false;
         }
@@ -571,12 +583,17 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
     dlg.showModal();
   }
 
-  async function sendAction(a, action, reason, progress) {
+  function sendAction(a, action, reason, progress) {
+    if (!discord) throw new Error('Sign in first.');
+    return queue({ appId: a.id, action, reason, session: discord.session }, progress);
+  }
+
+  /** Sends an encrypted request to the bot through the repo and waits for its encrypted answer. */
+  async function queue(payload, progress) {
     const r = DB.remote;
-    if (!discord) throw new Error('Sign in with Discord first.');
     const id = crypto.randomUUID();
-    progress('Encrypting and sending the request…');
-    const env = await encrypt({ id, appId: a.id, action, reason, discordToken: discord.token, at: Date.now() }, password);
+    progress('Sending the request…');
+    const env = await encrypt({ ...payload, id, at: Date.now() }, password);
     await gh(`contents/actions/${id}.json`, { method: 'PUT', body: JSON.stringify({ message: `action ${id}`, branch: r.queueBranch, content: btoa(JSON.stringify(env)) }) });
     const start = Date.now();
     while (Date.now() - start < 90_000) {
@@ -617,7 +634,6 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
   function toastLater(msg) { pendingToast = msg; }
 
   // ---------- boot ----------
-  handleOAuthReturn();
   const saved = kv.get(PW_KEY);
   if (saved) {
     $('#pw').value = saved;
