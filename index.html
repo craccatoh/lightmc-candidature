@@ -14,7 +14,7 @@
 :root{
   --bg:#0b0c14;--panel:#11131e;--card:#171a28;--card2:#1d2133;--border:#262a3d;--text:#e7e8f0;--muted:#8d92ab;
   --acc:#ffd700;--acc2:#ffb300;--acc-t:#1a1400;--discord:#5865f2;
-  --pending:#ffd700;--under_review:#ffa500;--accepted:#57f287;--denied:#ed4245;--cancelled:#8d92ab;
+  --pending:#ffd700;--under_review:#ffa500;--accepted:#57f287;--denied:#ed4245;--cancelled:#8d92ab;--ticket_closed:#8d92ab;
   --r:14px;
 }
 *{box-sizing:border-box}
@@ -246,9 +246,15 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
   const filter = { status: '', q: '', role: '', lang: '', sort: 'new' };
 
   // ---------- crypto (same format as the bot) ----------
-  async function deriveKey(pw, salt) {
-    const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
-    return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: ITER, hash: 'SHA-256' }, km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const keyCache = new Map(); // "pw|salt" -> CryptoKey (PBKDF2 is slow on purpose: do it once per salt)
+  function deriveKey(pw, salt) {
+    const k = `${pw}|${b64e(salt)}`;
+    if (!keyCache.has(k)) {
+      keyCache.set(k, crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey'])
+        .then((km) => crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: ITER, hash: 'SHA-256' }, km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']))
+        .catch((e) => { keyCache.delete(k); throw e; }));
+    }
+    return keyCache.get(k);
   }
   async function decrypt(env, pw) {
     const key = await deriveKey(pw, b64d(env.salt));
@@ -256,7 +262,8 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
     return JSON.parse(new TextDecoder().decode(pt));
   }
   async function encrypt(obj, pw) {
-    const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+    const salt = DB?.remote?.salt ? b64d(DB.remote.salt) : crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
     const key = await deriveKey(pw, salt);
     const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(obj)));
     return { v: 1, alg: 'AES-256-GCM', kdf: 'PBKDF2-SHA256', iter: ITER, salt: b64e(salt), iv: b64e(iv), data: b64e(ct) };
@@ -496,6 +503,7 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
       ['Joined the server', a.joinedAt ? fmt(a.joinedAt, {dateStyle:'medium'}) + small(ago(a.joinedAt)) : '—'],
       ['Reviewed by', a.reviewedBy ? esc(a.reviewedBy.tag) + (a.reviewedVia === 'dashboard' ? small('via dashboard') : '') : '—'],
       ['Reviewed', fmt(a.reviewedAt)],
+      ...(a.ticketChannelId ? [['Apply ticket', a.ticketClosedAt ? `🔒 closed ${ago(a.ticketClosedAt)}` : (g ? `<a href="https://discord.com/channels/${g}/${esc(a.ticketChannelId)}" target="_blank" rel="noopener">🎫 Open ticket</a>` : '🎫 open')]] : []),
     ];
     const others = DB.applications.filter((x) => x.userId === a.userId && x.id !== a.id);
     const answered = a.answers.filter((x) => x.answer).length;
@@ -566,13 +574,13 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
       try {
         const res = await sendAction(a, act, $('#dlgreason').value.trim(), (t) => $('#dlgstatus').innerHTML = `<span class="spin"></span>${esc(t)}`);
         if (res.ok) {
-          if (res.app) { const i = DB.applications.findIndex((x) => x.id === res.app.id); if (i >= 0) DB.applications[i] = res.app; }
+          applyResult(res, a, act);
           dlg.close(); render(); toast(res.text || 'Done');
-          setTimeout(() => refresh(true), 6000);
+          setTimeout(() => refresh(true), 4000);
         } else {
           $('#dlgstatus').innerHTML = `<span style="color:var(--denied)">⚠️ ${esc(res.title)}: ${esc(res.text)}</span>`;
           if (res.signedOut) { kv.del(DC_KEY); discord = null; renderAuth(); }
-          if (res.app) { const i = DB.applications.findIndex((x) => x.id === res.app.id); if (i >= 0) DB.applications[i] = res.app; render(); }
+          if (res.app || res.patch) { applyResult(res, a, act); render(); }
           $('#dlgcancel').disabled = false;
         }
       } catch (e) {
@@ -583,6 +591,17 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
     dlg.showModal();
   }
 
+  /** Update the local copy right away (full app via GitHub, compact patch via the fast relay). */
+  function applyResult(res, a, act) {
+    const i = DB.applications.findIndex((x) => x.id === (res.app?.id ?? res.patch?.id));
+    if (i < 0) return;
+    if (res.app) { DB.applications[i] = res.app; return; }
+    const cur = DB.applications[i], p = res.patch;
+    const changed = p.status !== cur.status;
+    Object.assign(cur, p);
+    if (changed) cur.history = [...(cur.history || []), { status: p.status, at: p.reviewedAt, by: p.reviewedBy, note: act === 'deny' ? p.reviewNotes : '', via: 'dashboard' }];
+  }
+
   function sendAction(a, action, reason, progress) {
     if (!discord) throw new Error('Sign in first.');
     return queue({ appId: a.id, action, reason, session: discord.session }, progress);
@@ -590,6 +609,46 @@ dialog::backdrop{background:#000a;backdrop-filter:blur(2px)}
 
   /** Sends an encrypted request to the bot through the repo and waits for its encrypted answer. */
   async function queue(payload, progress) {
+    if (DB.remote?.relay) {
+      try { return await relayQueue(payload, progress); }
+      catch (e) { if (!e.fallback) throw e; console.warn('Relay unavailable, using GitHub:', e.message); }
+    }
+    return githubQueue(payload, progress);
+  }
+
+  /** FAST path (~1-2s): private Discord webhook that only the bot reads. */
+  async function relayQueue(payload, progress) {
+    const url = DB.remote.relay;
+    const id = crypto.randomUUID();
+    progress('Sending the request…');
+    const env = await encrypt({ ...payload, id, at: Date.now() }, password);
+    let res;
+    try {
+      res = await fetch(`${url}?wait=true`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: JSON.stringify({ q: env }), username: 'Dashboard', allowed_mentions: { parse: [] } }) });
+    } catch (e) { throw Object.assign(new Error(e.message), { fallback: true }); }
+    if (!res.ok) throw Object.assign(new Error(`relay HTTP ${res.status}`), { fallback: true });
+    const msg = await res.json();
+    const start = Date.now();
+    while (Date.now() - start < 45_000) {
+      progress(`Waiting for the bot… ${Math.round((Date.now() - start) / 1000)}s`);
+      await sleep(600);
+      const g = await fetch(`${url}/messages/${msg.id}`, { cache: 'no-store' }).catch(() => null);
+      if (!g) continue;
+      if (g.status === 429) { await sleep(1500); continue; }
+      if (!g.ok) continue;
+      const content = (await g.json()).content || '';
+      if (!content.startsWith('{"a"')) continue;
+      const out = await decrypt(JSON.parse(content).a, password);
+      fetch(`${url}/messages/${msg.id}`, { method: 'DELETE' }).catch(() => {});
+      return out;
+    }
+    fetch(`${url}/messages/${msg.id}`, { method: 'DELETE' }).catch(() => {});
+    throw new Error('The bot did not answer within 45s. Is it online?');
+  }
+
+  /** FALLBACK path (~5-8s): encrypted files on the repo's queue branch. */
+  async function githubQueue(payload, progress) {
     const r = DB.remote;
     const id = crypto.randomUUID();
     progress('Sending the request…');
